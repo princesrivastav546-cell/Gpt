@@ -2,24 +2,24 @@ import os
 import time
 import secrets
 import sqlite3
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional, List, Tuple
 
 import httpx
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
 # ---------------- CONFIG ----------------
 MAILTM_BASE = "https://api.mail.tm"
 DB_PATH = "data.db"
 POLL_EVERY_SECONDS = int(os.environ.get("POLL_EVERY_SECONDS", "12"))
 
-# ---------------- BUTTONS (NO COMMANDS) ----------------
+# Render provides PORT for Web Services
+PORT = int(os.environ.get("PORT", "10000"))
+
+# ---------------- BUTTONS ----------------
 BTN_NEW = "📧 Generate new mail"
 BTN_DELETE = "🗑️ Delete current mail"
 BTN_LIST = "📜 My saved mails"
@@ -67,7 +67,6 @@ def init_db() -> None:
             password TEXT NOT NULL,
             token TEXT NOT NULL,
             created_at INTEGER NOT NULL,
-            label TEXT DEFAULT NULL,
             UNIQUE(chat_id, address)
         )
         """
@@ -139,11 +138,11 @@ def db_save_mailbox(chat_id: int, address: str, password: str, token: str) -> in
     return mailbox_id
 
 
-def db_list_mailboxes(chat_id: int) -> List[Tuple[int, str, Optional[str], int]]:
+def db_list_mailboxes(chat_id: int) -> List[Tuple[int, str, int]]:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute(
-        "SELECT id, address, label, created_at FROM mailboxes WHERE chat_id=? ORDER BY created_at DESC",
+        "SELECT id, address, created_at FROM mailboxes WHERE chat_id=? ORDER BY created_at DESC",
         (chat_id,),
     )
     rows = cur.fetchall()
@@ -205,10 +204,9 @@ async def mailtm_get_random_domain(client: httpx.AsyncClient) -> str:
     return items[0]["domain"]
 
 
-async def mailtm_create_account_and_token(client: httpx.AsyncClient) -> Tuple[str, str, str]:
+async def mailtm_create_account_and_token(client: httpx.AsyncClient):
     domain = await mailtm_get_random_domain(client)
-    local = secrets.token_hex(6)
-    address = f"{local}@{domain}"
+    address = f"{secrets.token_hex(6)}@{domain}"
     password = secrets.token_urlsafe(12)
 
     r1 = await client.post(f"{MAILTM_BASE}/accounts", json={"address": address, "password": password})
@@ -219,7 +217,6 @@ async def mailtm_create_account_and_token(client: httpx.AsyncClient) -> Tuple[st
 
     r2 = await client.post(f"{MAILTM_BASE}/token", json={"address": address, "password": password})
     r2.raise_for_status()
-
     token = r2.json()["token"]
     return address, password, token
 
@@ -245,49 +242,38 @@ async def mailtm_read_message(client: httpx.AsyncClient, token: str, msg_id: str
 def format_full_message(msg: dict) -> str:
     frm = (msg.get("from") or {}).get("address", "unknown")
     subj = msg.get("subject") or "(no subject)"
-    to_list = msg.get("to") or []
-    tos = ", ".join([(x.get("address") or "") for x in to_list if isinstance(x, dict)]) or "(unknown)"
     created = msg.get("createdAt") or ""
-
     text = (msg.get("text") or "").strip()
-    html = msg.get("html")
-
-    if not text and html:
-        text = "(This email is HTML-only. Text version not available.)"
-
+    if not text and msg.get("html"):
+        text = "(HTML-only email. No text version.)"
     if len(text) > 3500:
         text = text[:3500] + "\n…(truncated)"
-
     return (
         f"📩 <b>New Email</b>\n"
         f"<b>From:</b> {frm}\n"
-        f"<b>To:</b> {tos}\n"
         f"<b>Subject:</b> {subj}\n"
         f"<b>Date:</b> {created}\n\n"
         f"{text or '(empty body)'}"
     )
 
 
-# ---------------- HELPERS ----------------
-async def create_new_mail_for_chat(chat_id: int) -> Tuple[int, str]:
+async def create_new_mail_for_chat(chat_id: int):
     async with httpx.AsyncClient(timeout=25) as client:
         address, password, token = await mailtm_create_account_and_token(client)
     mailbox_id = db_save_mailbox(chat_id, address, password, token)
     db_set_active_mailbox(chat_id, mailbox_id)
-    return mailbox_id, address
+    return address
 
 
-# ---------------- BOT UI HANDLER ----------------
+# ---------------- TELEGRAM HANDLER ----------------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     txt = (update.message.text or "").strip()
 
-    # /start => directly create new mail (NO INTRO TEXT)
+    # /start => directly give new mail (no extra text)
     if txt.lower() == "/start":
-        # If you want ALWAYS new mail on every /start, keep this.
-        # If you want reuse existing active mail, tell me and I’ll change it.
         await update.message.reply_text("Creating your mail…", reply_markup=MAIN_MENU)
-        _, address = await create_new_mail_for_chat(chat_id)
+        address = await create_new_mail_for_chat(chat_id)
         await update.message.reply_text(
             f"📧 <b>Your mail:</b>\n<code>{address}</code>",
             parse_mode=ParseMode.HTML,
@@ -296,15 +282,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if txt == BTN_HELP:
-        await update.message.reply_text(
-            "Contact: @platoonleaderr",
-            reply_markup=MAIN_MENU,
-        )
+        await update.message.reply_text("Contact: @platoonleaderr", reply_markup=MAIN_MENU)
         return
 
     if txt == BTN_NEW:
-        await update.message.reply_text("Creating a new mail…", reply_markup=MAIN_MENU)
-        _, address = await create_new_mail_for_chat(chat_id)
+        await update.message.reply_text("Creating new mail…", reply_markup=MAIN_MENU)
+        address = await create_new_mail_for_chat(chat_id)
         await update.message.reply_text(
             f"📧 <b>Your new mail:</b>\n<code>{address}</code>",
             parse_mode=ParseMode.HTML,
@@ -315,17 +298,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if txt == BTN_LIST:
         rows = db_list_mailboxes(chat_id)
         if not rows:
-            await update.message.reply_text("No saved mails yet. Tap “Generate new mail”.", reply_markup=MAIN_MENU)
+            await update.message.reply_text("No saved mails yet.", reply_markup=MAIN_MENU)
             return
-
         active = db_get_active_mailbox(chat_id)
         active_id = active[0] if active else None
 
         lines = ["📜 <b>Your saved mails</b>\n"]
-        for mid, addr, _label, _created_at in rows[:30]:
+        for mid, addr, _ in rows[:30]:
             mark = "✅" if mid == active_id else "▫️"
             lines.append(f"{mark} <code>{addr}</code>\n<b>ID:</b> <code>{mid}</code>\n")
-
         lines.append("To reuse: tap “♻️ Reuse a mail”, then send the ID.")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
         return
@@ -337,7 +318,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         context.user_data["reuse_mode"] = True
         await update.message.reply_text(
-            "♻️ Send the <b>ID</b> of the mail you want to reuse.\nExample: <code>12</code>",
+            "Send the <b>ID</b> to reuse.\nExample: <code>12</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=REUSE_MENU,
         )
@@ -362,19 +343,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    # Reuse mode: user sends ID
     if context.user_data.get("reuse_mode"):
         if txt.isdigit():
             mailbox_id = int(txt)
-            rows = db_list_mailboxes(chat_id)
-            allowed_ids = {r[0] for r in rows}
-            if mailbox_id not in allowed_ids:
+            allowed = {r[0] for r in db_list_mailboxes(chat_id)}
+            if mailbox_id not in allowed:
                 await update.message.reply_text("Invalid ID. Try again.", reply_markup=REUSE_MENU)
                 return
-
             db_set_active_mailbox(chat_id, mailbox_id)
             context.user_data.pop("reuse_mode", None)
-
             active = db_get_active_mailbox(chat_id)
             address = active[1] if active else "(unknown)"
             await update.message.reply_text(
@@ -383,15 +360,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 reply_markup=MAIN_MENU,
             )
             return
-
-        await update.message.reply_text("Send a numeric ID or tap Back.", reply_markup=REUSE_MENU)
+        await update.message.reply_text("Send numeric ID or tap Back.", reply_markup=REUSE_MENU)
         return
 
-    # Fallback
     await update.message.reply_text("Use the menu buttons 👇", reply_markup=MAIN_MENU)
 
 
-# ---------------- AUTO-FORWARD (JOBQUEUE) ----------------
+# ---------------- AUTO-FORWARD ----------------
 async def poll_all_chats(context: ContextTypes.DEFAULT_TYPE) -> None:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
@@ -429,6 +404,18 @@ async def poll_all_chats(context: ContextTypes.DEFAULT_TYPE) -> None:
                     continue
 
 
+# ---------------- RENDER PORT SERVER ----------------
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def run_port_server():
+    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+
+
 # ---------------- MAIN ----------------
 def main() -> None:
     init_db()
@@ -436,10 +423,14 @@ def main() -> None:
     if not bot_token:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
 
+    # Start tiny web server so Render sees an open port
+    threading.Thread(target=run_port_server, daemon=True).start()
+
     app = Application.builder().token(bot_token).build()
     app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, handle_text))
 
     app.job_queue.run_repeating(poll_all_chats, interval=POLL_EVERY_SECONDS, first=5)
+
     app.run_polling(close_loop=False)
 
 
