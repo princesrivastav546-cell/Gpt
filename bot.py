@@ -17,8 +17,6 @@ from telegram.ext import (
 # ---------------- CONFIG ----------------
 MAILTM_BASE = "https://api.mail.tm"
 DB_PATH = "data.db"
-
-# Poll inbox every N seconds (set in Render env var if you want)
 POLL_EVERY_SECONDS = int(os.environ.get("POLL_EVERY_SECONDS", "12"))
 
 # ---------------- BUTTONS (NO COMMANDS) ----------------
@@ -257,7 +255,6 @@ def format_full_message(msg: dict) -> str:
     if not text and html:
         text = "(This email is HTML-only. Text version not available.)"
 
-    # Telegram ~4096 chars limit
     if len(text) > 3500:
         text = text[:3500] + "\n…(truncated)"
 
@@ -271,40 +268,45 @@ def format_full_message(msg: dict) -> str:
     )
 
 
+# ---------------- HELPERS ----------------
+async def create_new_mail_for_chat(chat_id: int) -> Tuple[int, str]:
+    async with httpx.AsyncClient(timeout=25) as client:
+        address, password, token = await mailtm_create_account_and_token(client)
+    mailbox_id = db_save_mailbox(chat_id, address, password, token)
+    db_set_active_mailbox(chat_id, mailbox_id)
+    return mailbox_id, address
+
+
 # ---------------- BOT UI HANDLER ----------------
-async def show_menu(update: Update, text: str) -> None:
-    await update.message.reply_text(text, reply_markup=MAIN_MENU)
-
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     txt = (update.message.text or "").strip()
 
-    # Allow /start but you don't need commands
-    if txt.lower() in ("/start", "start", "hi", "hello"):
-        await show_menu(
-            update,
-            "Disposable Mail Bot ✅\n\n"
-            "Auto-forward is ON: when an email arrives, I will send the full message here.\n\n"
-            "Use buttons below 👇",
+    # /start => directly create new mail (NO INTRO TEXT)
+    if txt.lower() == "/start":
+        # If you want ALWAYS new mail on every /start, keep this.
+        # If you want reuse existing active mail, tell me and I’ll change it.
+        await update.message.reply_text("Creating your mail…", reply_markup=MAIN_MENU)
+        _, address = await create_new_mail_for_chat(chat_id)
+        await update.message.reply_text(
+            f"📧 <b>Your mail:</b>\n<code>{address}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_MENU,
         )
         return
 
     if txt == BTN_HELP:
-        await show_menu(update, "Help / Contact:\n\nContact: @platoonleaderr")
+        await update.message.reply_text(
+            "Contact: @platoonleaderr",
+            reply_markup=MAIN_MENU,
+        )
         return
 
     if txt == BTN_NEW:
-        await update.message.reply_text("Creating a new inbox…", reply_markup=MAIN_MENU)
-        async with httpx.AsyncClient(timeout=25) as client:
-            address, password, token = await mailtm_create_account_and_token(client)
-
-        mailbox_id = db_save_mailbox(chat_id, address, password, token)
-        db_set_active_mailbox(chat_id, mailbox_id)
-
+        await update.message.reply_text("Creating a new mail…", reply_markup=MAIN_MENU)
+        _, address = await create_new_mail_for_chat(chat_id)
         await update.message.reply_text(
-            f"✅ <b>New inbox generated</b>\n\n📧 <code>{address}</code>\n\n"
-            f"Now wait — when emails arrive, I’ll forward full emails automatically.",
+            f"📧 <b>Your new mail:</b>\n<code>{address}</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=MAIN_MENU,
         )
@@ -313,17 +315,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if txt == BTN_LIST:
         rows = db_list_mailboxes(chat_id)
         if not rows:
-            await show_menu(update, "You have no saved mails yet. Tap “Generate new mail”.")
+            await update.message.reply_text("No saved mails yet. Tap “Generate new mail”.", reply_markup=MAIN_MENU)
             return
 
         active = db_get_active_mailbox(chat_id)
         active_id = active[0] if active else None
 
         lines = ["📜 <b>Your saved mails</b>\n"]
-        for mid, addr, label, _created_at in rows[:30]:
+        for mid, addr, _label, _created_at in rows[:30]:
             mark = "✅" if mid == active_id else "▫️"
-            label_txt = f" ({label})" if label else ""
-            lines.append(f"{mark} <code>{addr}</code>{label_txt}\n<b>ID:</b> <code>{mid}</code>\n")
+            lines.append(f"{mark} <code>{addr}</code>\n<b>ID:</b> <code>{mid}</code>\n")
 
         lines.append("To reuse: tap “♻️ Reuse a mail”, then send the ID.")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
@@ -332,11 +333,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if txt == BTN_REUSE:
         rows = db_list_mailboxes(chat_id)
         if not rows:
-            await show_menu(update, "No saved mails to reuse yet. Tap “Generate new mail”.")
+            await update.message.reply_text("No saved mails to reuse yet.", reply_markup=MAIN_MENU)
             return
         context.user_data["reuse_mode"] = True
         await update.message.reply_text(
-            "♻️ Send the <b>ID</b> of the mailbox you want to reuse.\nExample: <code>12</code>",
+            "♻️ Send the <b>ID</b> of the mail you want to reuse.\nExample: <code>12</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=REUSE_MENU,
         )
@@ -344,45 +345,46 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if txt == BTN_BACK:
         context.user_data.pop("reuse_mode", None)
-        await show_menu(update, "Back to menu ✅")
+        await update.message.reply_text("Menu ✅", reply_markup=MAIN_MENU)
         return
 
     if txt == BTN_DELETE:
         active = db_get_active_mailbox(chat_id)
         if not active:
-            await show_menu(update, "No active inbox to delete. Tap “Generate new mail”.")
+            await update.message.reply_text("No active mail to delete.", reply_markup=MAIN_MENU)
             return
         mailbox_id, address, _, _ = active
         db_delete_mailbox(chat_id, mailbox_id)
         await update.message.reply_text(
-            f"🗑️ Deleted current inbox:\n<code>{address}</code>",
+            f"🗑️ Deleted:\n<code>{address}</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=MAIN_MENU,
         )
         return
 
-    # Reuse mode: user sends ID number
+    # Reuse mode: user sends ID
     if context.user_data.get("reuse_mode"):
         if txt.isdigit():
             mailbox_id = int(txt)
             rows = db_list_mailboxes(chat_id)
             allowed_ids = {r[0] for r in rows}
             if mailbox_id not in allowed_ids:
-                await update.message.reply_text("That ID is not in your saved list. Try again.", reply_markup=REUSE_MENU)
+                await update.message.reply_text("Invalid ID. Try again.", reply_markup=REUSE_MENU)
                 return
+
             db_set_active_mailbox(chat_id, mailbox_id)
             context.user_data.pop("reuse_mode", None)
 
             active = db_get_active_mailbox(chat_id)
             address = active[1] if active else "(unknown)"
             await update.message.reply_text(
-                f"✅ Reusing inbox:\n<code>{address}</code>\n\nAuto-forward is active.",
+                f"✅ Reusing:\n<code>{address}</code>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=MAIN_MENU,
             )
             return
 
-        await update.message.reply_text("Please send a numeric ID (example: 12) or tap Back.", reply_markup=REUSE_MENU)
+        await update.message.reply_text("Send a numeric ID or tap Back.", reply_markup=REUSE_MENU)
         return
 
     # Fallback
@@ -391,10 +393,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ---------------- AUTO-FORWARD (JOBQUEUE) ----------------
 async def poll_all_chats(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Runs every POLL_EVERY_SECONDS.
-    Checks each chat's ACTIVE mailbox and pushes FULL emails automatically.
-    """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("SELECT chat_id, mailbox_id FROM active_mailbox")
@@ -421,7 +419,6 @@ async def poll_all_chats(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if mid and not db_is_seen(chat_id, mid):
                     new_ids.append(mid)
 
-            # Send oldest-first for nice reading
             for mid in reversed(new_ids):
                 try:
                     full = await mailtm_read_message(client, token, mid)
@@ -429,7 +426,6 @@ async def poll_all_chats(context: ContextTypes.DEFAULT_TYPE) -> None:
                     await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
                     db_mark_seen(chat_id, mid)
                 except Exception:
-                    # If send fails, do not mark as seen so it can retry later
                     continue
 
 
@@ -441,13 +437,9 @@ def main() -> None:
         raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
 
     app = Application.builder().token(bot_token).build()
-
-    # Single handler for everything typed
     app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, handle_text))
 
-    # Auto-forward repeating job (JobQueue now works because of requirements.txt extra)
     app.job_queue.run_repeating(poll_all_chats, interval=POLL_EVERY_SECONDS, first=5)
-
     app.run_polling(close_loop=False)
 
 
